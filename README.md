@@ -3,9 +3,14 @@ Digital compass acting as B&G Precision 9 based on ESP32 and BNO055 (tilt compen
 copy a lot of Code an Idea from https://github.com/htool/ESP32_Precision-9_compass_CMPS14 thanks for that.
 
 ## used Librarys 
-- Adafruit_BNO055
+- Adafruit_BNO055 copy the included modifyed directory to Librarys don't use the original.
+  or add  "bool getSensorMagneticOffsets(adafruit_bno055_offsets_t &offsets_type);"  to
+  the File "Adafruit_BNO055.h" in the public area.
+
 - Timo's NMEA2000 Library https://github.com/ttlappalainen/NMEA2000
-  (correct this : https://github.com/ttlappalainen/NMEA2000/issues/250 Timo hasn't done it yet)
+- NMEA2000_esp32  https://github.com/ttlappalainen/NMEA2000_esp32
+- Adafruit_BusIO
+- Adafruit_Unified_Sensor
 - BluetoothSerial
 
 ## BNO055
