@@ -1,7 +1,11 @@
 //
 // NMEA 2000 Kurssensor 
-// Bernd Cirotzki 2022 -
+// Bernd Cirotzki 2022 - 2024
 //
+// Ausgabe im NMEA 2000-Format  
+// - Meldungen: PGN 127250, 127251, 127257, 127252
+// - Datenausgabe: Magnetische Kursdaten (20 Hz), Dreh-Geschwindigkeit (20 Hz),
+// Neigen/Rollen (10 Hz), Seegangsausgleich (10 Hz)
 
 #define ESP32_CAN_TX_PIN GPIO_NUM_32  // Set CAN TX port TX to TX !!
 #define ESP32_CAN_RX_PIN GPIO_NUM_34  // Set CAN RX port RX to RX !!
@@ -21,17 +25,15 @@
 #include <Time.h>
 #include <N2kMsg.h>
 #include <NMEA2000.h>
-#include <N2kMessages.h>
+#include "N2kMessages.h"
 #include <NMEA2000_CAN.h>
 #include "BluetoothStream.h"
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
+#include "heave.h"
 
 //5 seconds WDT127237
 #define WDT_TIMEOUT 40
-
-// To Put out debug to Serial
-//#define DEBUG 1
 
 // Offset set by Plotter
 enum EEP_ADDR
@@ -60,13 +62,13 @@ float heading, heading_true,
 int heading_offset_deg = 0,      
     heel_offset_deg = 0,
     trim_offset_deg = 0;
-bool send_heading = true;                           // to do 20 vs 10hz
+bool send_100ms = true;                           // to do 20 vs 10hz
 
 unsigned char compass_autocalibration = 0x00;
 
 
 // List here messages your device will transmit.
-const unsigned long TransmitMessagesCompass[] PROGMEM = { 127250L, 127251L, 127257L , 0 }; //Vessel Heading, Rate of Turn, Attitude
+const unsigned long TransmitMessagesCompass[] PROGMEM = { 127250L, 127251L, 127257L , 127252, 0 }; //Vessel Heading, Rate of Turn, Attitude, Heave
 const unsigned long ReceiveMessages[] PROGMEM = { 127258L, // Magnetic variation
                                                   130845L, // B&G Config from Plotter
                                                   130850L  // B&G Calibration start
@@ -119,10 +121,18 @@ float XmNew;
 float YmNew;
 float XmOld;
 float YmOld;
-#ifdef DEBUG
-float Heading; // only use filtered Heading
-#endif
+
+#define MAXHEADINGSUMME 20 // Messwerte von 1 Sekunden zusammenfassen
+double Yaw;
+float yawFiltered = 0;
+float diffyaw = 0;
+float yawMag = 0;
 float HeadingFiltered;
+float Headingarray[MAXHEADINGSUMME];
+uint8_t ArrayField=0;
+uint8_t ValidFields=0;
+bool Filterindikator=false;
+
 double HeadingVariation = N2kDoubleNA;
 double EnteredVariation = N2kDoubleNA;
 unsigned long LastVariation;
@@ -153,7 +163,6 @@ bool Adafruit_BNO055::getSensorMagneticOffsets(adafruit_bno055_offsets_t &offset
     /* Magnetometer radius = +/- 960 LSB */
     offsets_type.mag_radius =
         (read8(MAG_RADIUS_MSB_ADDR) << 8) | (read8(MAG_RADIUS_LSB_ADDR));
-
     setMode(lastMode);
     return true;
 }
@@ -162,10 +171,11 @@ Adafruit_BNO055 BNO055 =  Adafruit_BNO055();
 
 adafruit_bno055_offsets_t BNO055Offset;
 
-const uint16_t EEPROM_SIZE = (18 + sizeof(adafruit_bno055_offsets_t) + 363 + 2 * 360 + 1);
+const uint16_t EEPROM_SIZE = (18 + sizeof(adafruit_bno055_offsets_t) + 725 + 2 * 720 + 2);
 const uint16_t ADDR_Deviationtabel = 19 + sizeof(adafruit_bno055_offsets_t);
-const uint16_t ADDR_Deviationtabel_copy1 = ADDR_Deviationtabel + 363;
-const uint16_t ADDR_Deviationtabel_copy2 = ADDR_Deviationtabel_copy1 + 360;
+const uint16_t ADDR_Deviationtabel_copy1 = ADDR_Deviationtabel + 725;
+const uint16_t ADDR_Deviationtabel_copy2 = ADDR_Deviationtabel_copy1 + 720;
+const uint16_t ADDR_SEND_HEAVE = ADDR_Deviationtabel_copy2 + 720;
 
 BluetoothStream *pBlueTooth;
 uint8_t LastMAGCal = 0;
@@ -179,6 +189,9 @@ bool Derr2 = false;
 bool SendHeadingwithDeviation;
 bool showDiv = false;
 unsigned long LastShowdiv;
+
+heave Heave;
+double HeaveValue = 0;
                                          
 void setup() 
 {
@@ -234,20 +247,38 @@ void setup()
      Serial.println("No Ground - Calibration from EEPROM");
      pBlueTooth->SendString("No Ground - Calibration from EEPROM\n");
   }
-  if(EEPROM.readByte(ADDR_Deviationtabel + 361) != 0)
+  if(EEPROM.readByte(ADDR_SEND_HEADING) != 0)
   {
+    if(EEPROM.readByte(ADDR_Deviationtabel + 721) != 0)
+    {
      Serial.println("Send Heading with Deviation");
      pBlueTooth->SendString("Send Heading with Deviation\n");
      SendHeadingwithDeviation = true;
-  }
-  else
-  {    
+    }
+    else
+    {     
      Serial.println("Not Send Heading with Deviation");  
      pBlueTooth->SendString("Not Send Heading with Deviation\n");
      SendHeadingwithDeviation = false;
+    }
+  }
+  else
+  {
+     Serial.println("Not Send Heading to N2k");  
+     pBlueTooth->SendString("Not Send Heading to N2k\n");
+  }
+  if(EEPROM.readByte(ADDR_SEND_HEAVE) != 0)
+  {
+      Serial.println("Send Heave to N2k");  
+      pBlueTooth->SendString("Send Heave to N2k\n");
+  }
+  else
+  {
+      Serial.println("Do not send Heave to N2k");  
+      pBlueTooth->SendString("Do not send Heave to N2k\n");
   }
   delay(500);  
-  send_heading=true;
+  send_100ms=true;
   int8_t temp=BNO055.getTemp();
   BNO055.setExtCrystalUse(true);  // Sets the external Crystal for use
   
@@ -294,11 +325,7 @@ bool GetBNO055Values()
 {
   if (SampleTimer + BNO055_SAMPLERATE_DELAY_MS <= millis())                  // Set timer
   {
-    SampleTimer = millis();  
-#ifdef DEBUG    
-    uint8_t Calsystem, Calgyro, Calaccel, Calmag = 0;
-    BNO055.getCalibration(&Calsystem, &Calgyro, &Calaccel, &Calmag);
-#endif    
+    SampleTimer = millis();    
     imu::Vector<3> acc = BNO055.getVector(Adafruit_BNO055::VECTOR_ACCELEROMETER);
     imu::Vector<3> gyr = BNO055.getVector(Adafruit_BNO055::VECTOR_GYROSCOPE);
     imu::Vector<3> mag = BNO055.getVector(Adafruit_BNO055::VECTOR_MAGNETOMETER);
@@ -341,6 +368,10 @@ bool GetBNO055Values()
     PitchRad = PitchHead * degToRad + trim_offset_rad;
     RollRad  = RollHead * degToRad + heel_offset_rad;
 
+    // Heave berechnung
+           
+    HeaveValue = Heave.GetHeave((sqrt(acc.x() * acc.x() + acc.y() * acc.y() + acc.z() * acc.z() )), PitchAccHead, RollAccHead, dt);
+
     // Heading berechnen
     // with tilt compensated ... standard formel.
     MagX_uT = mag.x() * 0.99 + MagX_uT_old * 0.01;
@@ -358,52 +389,57 @@ bool GetBNO055Values()
     
     XmNew=0.9*XmOld + 0.1*Xm;
     YmNew=0.9*YmOld + 0.1*Ym;
-#ifdef DEBUG
-    Heading=atan2(Ym,Xm) * radToDeg;
-    if (Heading < 0) Heading += 360.0;
-#endif
-    HeadingFiltered=atan2(YmNew,XmNew) * radToDeg;
+
+    HeadingFiltered=atan2(YmNew,XmNew);
+   
+    if ((HeadingFiltered >= 0 && Filterindikator == true) || (HeadingFiltered < 0 && Filterindikator == false))
+    {
+      if (ValidFields < MAXHEADINGSUMME)
+         ValidFields++;
+      Headingarray[ArrayField] = HeadingFiltered;
+      ArrayField++;
+      if (ArrayField >= MAXHEADINGSUMME)
+         ArrayField = 0;
+      HeadingFiltered = 0;
+      for(uint8_t fi = 0; fi < ValidFields; fi++)
+      {
+        HeadingFiltered += Headingarray[fi];
+      }
+      HeadingFiltered = HeadingFiltered / ValidFields; 
+    }
+    else // is aroud 180 Grad. Error bereich.
+    {
+       if (HeadingFiltered >= 0) Filterindikator = true;
+       if (HeadingFiltered <  0) Filterindikator = false;
+       ArrayField = 1;
+       Headingarray[0] = HeadingFiltered;
+       ValidFields = 1;
+    }
+    
+    HeadingFiltered *= radToDeg;
+    
     HeadingFiltered -= heading_offset_deg;  // Set from Plotter
     if (HeadingFiltered < 0) HeadingFiltered += 360.0;
     if (HeadingFiltered >= 360) HeadingFiltered -= 360.0;
+
+    // Calculate Yaw    
+    updateYaw(gyr.z());
     
     RateofTurnOld=RateofTurn;
     XmOld=XmNew;
     YmOld=YmNew; 
-#ifdef DEBUG
-    Serial.print(acc.x()/9.8*10);
-    Serial.print(",");
-    Serial.print(acc.y()/9.8*10);
-    Serial.print(",");
-    Serial.print(acc.z()/9.8*10);
-    Serial.print(",");
-    Serial.print(gyr.x());
-    Serial.print(",");
-    Serial.print(gyr.y());
-    Serial.print(",");
-    Serial.print(gyr.z());
-    Serial.print(",");
-    Serial.print(Calsystem);
-    Serial.print(",");
-    Serial.print(PitchAcc);
-    Serial.print(",");
-    Serial.print(RollAcc);
-    Serial.print(",");
-    Serial.print(mag.x());
-    Serial.print(",");
-    Serial.print(mag.y());
-    Serial.print(",");
-    Serial.print(mag.z());
-    Serial.print(",");
-    Serial.print(-Roll);
-    Serial.print(",");
-    Serial.print(Heading);
-    Serial.print(",");
-    Serial.println(HeadingFiltered);
-#endif
     return true; 
   }
   return false;
+}
+
+void updateYaw(double gyroZ)
+{
+    if (abs (yawMag - HeadingFiltered) > 50)  // Für den Nulldurchgand 0 - 359 deg
+        yawFiltered = HeadingFiltered - diffyaw;                
+    yawFiltered = 0.992 * (yawFiltered + gyroZ * dt ) + 0.008 * HeadingFiltered;
+    diffyaw = HeadingFiltered - yawFiltered;    
+    yawMag = HeadingFiltered;
 }
 
 void loop()
@@ -417,25 +453,37 @@ void loop()
      }
      else
      {
-      if (send_heading)
+      if (send_100ms) // 10 Hz (100ms)
       {
-        if (0 != EEPROM.readByte(ADDR_SEND_HEADING))
+        // Rate of Turn
+        N2kMsg.Clear();
+        Yaw = diffyaw * degToRad;
+        if (abs(Yaw) > 3.14) Yaw = N2kDoubleNA; // This is enought else it is an error around 360 - 0 deg.
+        SetN2kAttitude(N2kMsg, SID, Yaw, -((Pitch * degToRad) - trim_offset_rad), -((Roll * degToRad) - heel_offset_rad));        
+        NMEA2000.SendMsg(N2kMsg, DEV_COMPASS);
+        // heave
+        N2kMsg.Clear();
+        if (Heave.HeaveAvailable() && 0 != EEPROM.readByte(ADDR_SEND_HEAVE))
         {
+          SetN2kHeave(N2kMsg, SID, HeaveValue);
+          NMEA2000.SendMsg(N2kMsg, DEV_COMPASS);
+        }
+      }
+      send_100ms = !send_100ms;
+      // 20 Hz (50ms)
+      if (0 != EEPROM.readByte(ADDR_SEND_HEADING))
+      {
           N2kMsg.Clear();
           if(SendHeadingwithDeviation)
             SetN2kPGN127250(N2kMsg, SID, (GetHeadingwithDeviation(HeadingFiltered) * degToRad), N2kDoubleNA, N2kDoubleNA, N2khr_magnetic);
           else
             SetN2kPGN127250(N2kMsg, SID, (HeadingFiltered * degToRad), GetDeviation(HeadingFiltered), GetVariation(), N2khr_magnetic);
           NMEA2000.SendMsg(N2kMsg, DEV_COMPASS);
-        }
-        // Rate of Turn
-        N2kMsg.Clear();
-        SetN2kRateOfTurn(N2kMsg, SID, -(RateofTurn * degToRad)); // radians 
-        NMEA2000.SendMsg(N2kMsg, DEV_COMPASS);
       }
-      send_heading = !send_heading;
-      SetN2kAttitude(N2kMsg, SID, N2kDoubleNA, -((Pitch * degToRad) - trim_offset_rad), -((Roll * degToRad) - heel_offset_rad));
-      NMEA2000.SendMsg(N2kMsg, DEV_COMPASS);
+      // Rate of Turn
+      N2kMsg.Clear();
+      SetN2kRateOfTurn(N2kMsg, SID, -(RateofTurn * degToRad)); // radians 
+      NMEA2000.SendMsg(N2kMsg, DEV_COMPASS);      
       SID++; if (SID > 250) SID = 1;
      }
   }
@@ -461,53 +509,43 @@ double GetVariation()
 double GetDeviation(float HeadingFiltered)
 {
     int D;
-    int8_t DHv, DLv;
+    int16_t DHv, DLv;
     uint8_t j,i;
     char dummy[10];
     D = (int)round(HeadingFiltered);
     if(D >= 360) D -= 360;
-    int8_t v = (int8_t)EEPROM.readByte(ADDR_Deviationtabel + D);
-    if (v == 0x7F)  // Not set  try to interpolier
+    int16_t v;
+    EEPROM.get(ADDR_Deviationtabel + D*2, v);
+    if (v == 0x7FFF)  // Not set  try to interpolier
     {
        for (j = 1; j < 40; j++)
        {
           D = (int)round(HeadingFiltered) - j;
           if(D < 0) D += 360;
-          DLv = (int8_t)EEPROM.readByte(ADDR_Deviationtabel + D);
-          if (DLv != 0x7F)
+          EEPROM.get(ADDR_Deviationtabel + D*2, DLv);
+          if (DLv != 0x7FFF)
              break;          
        }
        for (i = 1; i < 40; i++)
        {
           D = (int)round(HeadingFiltered) + i;
           if(D >= 360) D -= 360;
-          DHv = (int8_t)EEPROM.readByte(ADDR_Deviationtabel + D);
-          if (DHv != 0x7F)
+          EEPROM.get(ADDR_Deviationtabel + D*2, DHv);
+          if (DHv != 0x7FFF)
              break;          
        }
-       if (DHv != 0x7F && DLv != 0x7F)
+       if (DHv != 0x7FFF && DLv != 0x7FFF)
        {
-          v = (int8_t)((double)DLv *(double)((double)i/((double)j+(double)i))  + (double)DHv * (double)((double)j/((double)j+(double)i)));
+          v = (int16_t)((double)DLv *(double)((double)i/((double)j+(double)i))  + (double)DHv * (double)((double)j/((double)j+(double)i)));
           if(showDiv && LastShowdiv + 400 < millis())
           {
             LastShowdiv = millis();            
             sprintf(dummy,"%3.1f",HeadingFiltered);
-            pBlueTooth->SendString(" Heading:"); pBlueTooth->SendString(dummy);pBlueTooth->SendString(" ");
-            /*sprintf(dummy,"%i",i);
-            pBlueTooth->SendString(" i:"); pBlueTooth->SendString(dummy);pBlueTooth->SendString(" ");
-            sprintf(dummy,"%i",j);
-            pBlueTooth->SendString(" j:"); pBlueTooth->SendString(dummy);pBlueTooth->SendString(" ");
-            sprintf(dummy,"%i",DLv);
-            pBlueTooth->SendString(" DLv:"); pBlueTooth->SendString(dummy);pBlueTooth->SendString(" ");
-            sprintf(dummy,"%i",DHv);
-            pBlueTooth->SendString(" DHv:"); pBlueTooth->SendString(dummy);pBlueTooth->SendString(" ");
-            sprintf(dummy,"%i",v);
-            pBlueTooth->SendString(" v:");pBlueTooth->SendString(dummy);pBlueTooth->SendString(" \n");*/
-            
-            sprintf(dummy,"%2.1f",(float) ((int8_t)v / (double)10));
+            pBlueTooth->SendString(" Heading:"); pBlueTooth->SendString(dummy);pBlueTooth->SendString(" ");            
+            sprintf(dummy,"%2.1f",(float) ((int16_t)v / (double)10));
             pBlueTooth->SendString("Deviation :");pBlueTooth->SendString(dummy);pBlueTooth->SendString(" (interpoliert)\n");
           }
-          return (((double)((int8_t)v / (double)10.0)) * degToRad);
+          return (((double)((int16_t)v / (double)10.0)) * degToRad);
        }
        else
        {
@@ -526,44 +564,45 @@ double GetDeviation(float HeadingFiltered)
         LastShowdiv = millis();
         sprintf(dummy,"%3.1f",HeadingFiltered);
         pBlueTooth->SendString(" Heading:"); pBlueTooth->SendString(dummy);pBlueTooth->SendString(" ");
-        sprintf(dummy,"%2.1f",(float) ((int8_t)v / (double)10));
+        sprintf(dummy,"%2.1f",(float) ((int16_t)v / (double)10));
         pBlueTooth->SendString("Deviation :");pBlueTooth->SendString(dummy);pBlueTooth->SendString(" \n");    
     }
-    return (((double)((int8_t)v / (double)10.0)) * degToRad);
+    return (((double)((int16_t)v / (double)10.0)) * degToRad);
 }
 
 float GetHeadingwithDeviation(float HeadingFiltered)
 {
     int D;
-    int8_t DHv, DLv;
+    int16_t DHv, DLv;
     uint8_t j,i;
     float HeadingReturn;
     char dummy[10];
     D = (int)round(HeadingFiltered);
     if(D >= 360) D -= 360;
-    int8_t v = (int8_t)EEPROM.readByte(ADDR_Deviationtabel + D);
-    if (v == 0x7F)  // Not set  try to interpolier
+    int16_t v;
+    EEPROM.get(ADDR_Deviationtabel + D*2, v);
+    if (v == 0x7FFF)  // Not set  try to interpolier
     {
        for (j = 1; j < 40; j++)
        {
           D = (int)round(HeadingFiltered) - j;
           if(D < 0) D += 360;
-          DLv = (int8_t)EEPROM.readByte(ADDR_Deviationtabel + D);
-          if (DLv != 0x7F)
+          EEPROM.get(ADDR_Deviationtabel + D*2, DLv);
+          if (DLv != 0x7FFF)
              break;          
        }
        for (i = 1; i < 40; i++)
        {
           D = (int)round(HeadingFiltered) + i;
           if(D >= 360) D -= 360;
-          DHv = (int8_t)EEPROM.readByte(ADDR_Deviationtabel + D);
-          if (DHv != 0x7F)
+          EEPROM.get(ADDR_Deviationtabel + D*2, DHv);
+          if (DHv != 0x7FFF)
              break;          
        }
-       if (DHv != 0x7F && DLv != 0x7F)
+       if (DHv != 0x7FFF && DLv != 0x7FFF)
        {
-          v = (int8_t)((double)DLv *(double)((double)i/((double)j+(double)i))  + (double)DHv * (double)((double)j/((double)j+(double)i)));
-          HeadingReturn = HeadingFiltered + (float) ((int8_t)v / (double)10);
+          v = (int16_t)((double)DLv *(double)((double)i/((double)j+(double)i))  + (double)DHv * (double)((double)j/((double)j+(double)i)));
+          HeadingReturn = HeadingFiltered + (float) ((int16_t)v / (double)10);
           if (HeadingReturn < 0) HeadingReturn += 360;
           if (HeadingReturn >= 360) HeadingReturn -= 360;
           if(showDiv && LastShowdiv + 400 < millis())
@@ -581,7 +620,7 @@ float GetHeadingwithDeviation(float HeadingFiltered)
             pBlueTooth->SendString(" DHv:"); pBlueTooth->SendString(dummy);pBlueTooth->SendString(" ");
             sprintf(dummy,"%i",v);
             pBlueTooth->SendString(" v:");pBlueTooth->SendString(dummy);pBlueTooth->SendString(" \n");*/            
-            sprintf(dummy,"%2.1f",(float) ((int8_t)v / (double)10));
+            sprintf(dummy,"%2.1f",(float) ((int16_t)v / (double)10));
             pBlueTooth->SendString("Deviation :");pBlueTooth->SendString(dummy);pBlueTooth->SendString(" (interpoliert) ");
             sprintf(dummy,"%3.1f",HeadingReturn);
             pBlueTooth->SendString("new Heading:"); pBlueTooth->SendString(dummy);pBlueTooth->SendString(" \n");
@@ -600,7 +639,7 @@ float GetHeadingwithDeviation(float HeadingFiltered)
        }
        return HeadingFiltered;
     }
-    HeadingReturn = HeadingFiltered + (float) ((int8_t)v / (double)10);
+    HeadingReturn = HeadingFiltered + (float) ((int16_t)v / (double)10);
     if (HeadingReturn < 0) HeadingReturn += 360;
     if (HeadingReturn >= 360) HeadingReturn -= 360;
     if(showDiv && LastShowdiv + 400 < millis())
@@ -608,7 +647,7 @@ float GetHeadingwithDeviation(float HeadingFiltered)
         LastShowdiv = millis();
         sprintf(dummy,"%3.1f",HeadingFiltered);
         pBlueTooth->SendString("(send with Deviation) old Heading:"); pBlueTooth->SendString(dummy);pBlueTooth->SendString(" ");
-        sprintf(dummy,"%2.1f",(float) ((int8_t)v / (double)10));
+        sprintf(dummy,"%2.1f",(float) ((int16_t)v / (double)10));
         pBlueTooth->SendString("Deviation :");pBlueTooth->SendString(dummy);pBlueTooth->SendString(" ");
         sprintf(dummy,"%3.1f",HeadingReturn);
         pBlueTooth->SendString("new Heading:"); pBlueTooth->SendString(dummy);pBlueTooth->SendString(" \n");    
@@ -646,31 +685,32 @@ void MakeBoatDeviationtable()
         Variation = EnteredVariation;
     // COG = Heading + Variation + Deviation
     double Deviation = DEGCOG - HeadingFiltered - Variation;
-    if ( Deviation < -12)
+    if ( Deviation < -50)
     { 
        Derr1 = true;       
-       Deviation = -12;
+       Deviation = -50;
     }
-    if ( Deviation > 12)
+    if ( Deviation > 50)
     {
        Derr2 = true;
-       Deviation = 12;
+       Deviation = 50;
     }
     // Write to EEPROM
-    int8_t v  = 0x7F;
-    if (Deviation != 12 && Deviation != -12)   // Not when Deviation ist bad
-       v = (int8_t) (Deviation * 10); // Kommastelle
+    int16_t v  = 0x7FFF;
+    if (Deviation != 50 && Deviation != -50)   // Not when Deviation ist bad
+       v = (int16_t) (Deviation * 10); // Kommastelle
     int D = (int)round(HeadingFiltered);
     if(D >= 360) D -= 360;
-    int8_t ve = (int8_t)EEPROM.readByte(ADDR_Deviationtabel + D);
-    if( ve != 0x7F) // Not first Use
+    int16_t ve;
+    EEPROM.get(ADDR_Deviationtabel + D*2, ve);
+    if( ve != 0x7FFF) // Not first Use
     {
-       if (v != 0x7F)   // Not when Deviation ist bad
-          v = (int8_t) ((double) v * 0.9 + (double)ve * 0.1);
+       if (v != 0x7FFF)   // Not when Deviation ist bad
+          v = (int16_t) ((double) v * 0.5 + (double)ve * 0.5);
        else
           v = ve;       // Do not loose the old value
     }   
-    EEPROM.writeByte(ADDR_Deviationtabel + D , (int8_t)v);
+    EEPROM.put(ADDR_Deviationtabel + D*2 , (int16_t)v);
     if (LastMakeTabelOutout < millis())
     {
        char dummy[10];
@@ -685,13 +725,13 @@ void MakeBoatDeviationtable()
        pBlueTooth->SendString("\n");
        if (Derr1)
        {
-         Serial.println("Deviation < -12 do not set");
-         pBlueTooth->SendString("Deviation < -12 do not set\n");
+         Serial.println("Deviation < -50 do not set");
+         pBlueTooth->SendString("Deviation < -50 do not set\n");
        }
        if (Derr2)
        {
-         Serial.println("Deviation > 12 do not set");
-         pBlueTooth->SendString("Deviation > 12 do not set\n");
+         Serial.println("Deviation > 50 do not set");
+         pBlueTooth->SendString("Deviation > 50 do not set\n");
        }
        Derr1 = false;
        Derr2 = false;
@@ -721,17 +761,28 @@ void CheckForCalibration()
         pBlueTooth->ConfigBluetooth(Val);
       }
       else
-        pBlueTooth->ParseMessages(Val);
+      {
+        pBlueTooth->ParseMessages(Val);        
+      }
+      if(Val.endsWith("\n"))
+            Val.replace("\n","");
+      if(Val.endsWith("\r"))
+            Val.replace("\r","");
       pBlueTooth->SendString("\n");
       if(Val == String("help") )
       {
+         Serial.println("SHDEV     :  Only from Serial. Show bounded Devices");
+         Serial.println("DELDEV    :  Only from Serial. Delete bounded Devices");
          Serial.println("reset     :  Reset Kurssensor.");
-         Serial.println("sendhead  :  Switch Send Heading ON.");
-         Serial.println("stophead  :  Switch Send heading OFF.");
+         Serial.println("sendhead  :  Switch Send Heading ON. to N2k and to Bluetooth.");
+         Serial.println("stophead  :  Switch Send heading OFF. to N2k and to Bluetooth.");
          Serial.println("senddev   :  Send Heading with Deviation");
          Serial.println("stopdev   :  Do not Send Heading with Deviation. Send Deviation in the rigth field");
-         Serial.println("cal       :  Start Sensor Calibration.");
-         Serial.println("calmag    :  Start Sensor only Magnetic Calibration.");
+         Serial.println("sendheave :  Switch Send Heave N2k ON. (default On) \n");
+         Serial.println("stopheave :  Switch Send Heave N2k OFF.\n");
+         Serial.println("calgyro   :  Start Gyro Sensor Calibration.");
+         Serial.println("cal       :  Start Sensor Calibration. Make calacc and calgyro again");
+         Serial.println("calacc    :  Start Sensor accel Calibration.");
          Serial.println("clearcal  :  Delete the Calibration.");
          Serial.println("setground :  Set the Ground Calibration.");
          Serial.println("setvari V :  Define Magnetic Variation V (this has prio to the Variation over NMEA2000) East = positiv");
@@ -739,21 +790,26 @@ void CheckForCalibration()
          Serial.println("scogdev   :  Stop turning Mode.");
          Serial.println("coghead   :  Save one the Value at this time calculate from COG and Heading");
          Serial.println("hdev H D  :  Save Deviation Value D (NA = delete) at Heading H");
-         Serial.println("devdiv D  :  Enter Deviation D for the momentan Heading");
-         Serial.println("cleardev  :  delete Deviationtabel");
-         Serial.println("printdev  :  show Deviationtabel Values");
-         Serial.println("showdev   :  show Deviation Values used at the moment (turn off when aktiv)");
+         Serial.println("devdev D  :  Enter Deviation D for the momentan Heading");
+         Serial.println("cleardev  :  delete activ Deviationtabel");
+         Serial.println("printdev  :  show activ Deviationtabel Values on Bluetooth and Serial");
+         Serial.println("showdev   :  print Heading Values and Deviation Values used at the moment to Bluetooth (turns off when aktiv)");
          Serial.println("copyd1    :  Save Deviationtabel to Storage Area 1");
          Serial.println("copyd2    :  Save Deviationtabel to Storage Area 2");
          Serial.println("restd1    :  Restore Deviationtabel from Storage Area 1");
          Serial.println("restd2    :  Restore Deviationtabel from Storage Area 2");
+         Serial.println("printd1   :  show Deviationtabel Values from Storage Area 1 on Bluetooth and Serial");
+         Serial.println("printd2   :  show Deviationtabel Values from Storage Area 2 on Bluetooth and Serial");
          pBlueTooth->SendString("reset     :  Reset Kurssensor.\n");
-         pBlueTooth->SendString("sendhead  :  Switch Send Heading ON.\n");
-         pBlueTooth->SendString("stophead  :  Switch Send heading OFF.\n");
-         pBlueTooth->SendString("senddev   :  Send Heading with Deviation\n");
+         pBlueTooth->SendString("sendhead  :  Switch Send Heading ON. to N2k use showdev to send to Bluetooth.\n");
+         pBlueTooth->SendString("stophead  :  Switch Send heading OFF. to N2k and to Bluetooth.\n");         
+         pBlueTooth->SendString("senddev   :  Send the Heading with Deviation\n");
          pBlueTooth->SendString("stopdev   :  Do not Send Heading with Deviation. Send Deviation in the rigth field\n");
-         pBlueTooth->SendString("cal       :  Start Sensor Calibration.\n");
-         pBlueTooth->SendString("calmag    :  Start Sensor only Magnetic Calibration.\n");
+         pBlueTooth->SendString("sendheave :  Switch Send Heave N2k ON. (default On) \n");
+         pBlueTooth->SendString("stopheave :  Switch Send Heave N2k OFF.\n");
+         pBlueTooth->SendString("calgyro   :  Start Gyro Sensor Calibration.\n");
+         pBlueTooth->SendString("cal       :  Start Sensor Calibration. Make calacc and calgyro again\n");
+         pBlueTooth->SendString("calacc    :  Start Sensor accel Calibration.\n");
          pBlueTooth->SendString("clearcal  :  Delete the Calibration.\n");
          pBlueTooth->SendString("setground :  Set the Ground Calibration.\n");
          pBlueTooth->SendString("setvari V :  Define Magnetic Variation V (this has prio to the Variation over NMEA2000) East = positiv\n");
@@ -762,21 +818,23 @@ void CheckForCalibration()
          pBlueTooth->SendString("coghead   :  Save one the Value at this time calculate from COG and Heading\n");
          pBlueTooth->SendString("hdev H D  :  Save Deviation Value D (NA = delete) at Heading H\n");
          pBlueTooth->SendString("defdev D  :  Enter Deviation D for the momentan Heading\n");
-         pBlueTooth->SendString("cleardev  :  delete Deviationtabel\n");
-         pBlueTooth->SendString("printdev  :  show Deviationtabel Values\n");
-         pBlueTooth->SendString("showdev   :  show Deviation Values used at the moment (turn off when aktiv)\n");
+         pBlueTooth->SendString("cleardev  :  delete activ Deviationtabel\n");
+         pBlueTooth->SendString("printdev  :  show activ Deviationtabel Values on Bluetooth and Serial\n");
+         pBlueTooth->SendString("showdev   :  print Heading Values and Deviation Values used at the moment to Bluetooth(turns off when aktiv)\n");
          pBlueTooth->SendString("copyd1    :  Save Deviationtabel to Storage Area 1\n");
          pBlueTooth->SendString("copyd2    :  Save Deviationtabel to Storage Area 2\n");
          pBlueTooth->SendString("restd1    :  Restore Deviationtabel from Storage Area 1\n");
          pBlueTooth->SendString("restd2    :  Restore Deviationtabel from Storage Area 2\n");
+         pBlueTooth->SendString("printd1   :  show Deviationtabel Values from Storage Area 1 on Bluetooth and Serial\n");
+         pBlueTooth->SendString("printd2   :  show Deviationtabel Values from Storage Area 2 on Bluetooth and Serial\n");
       }
       if(Val == String("copyd1"))
       {
-         int8_t v;
+         int16_t v;
          for (uint16_t i = 0; i < 360;i++)
          {
-             v = (int8_t)EEPROM.readByte(ADDR_Deviationtabel + i);
-             EEPROM.writeByte(ADDR_Deviationtabel_copy1 + i, v);
+             EEPROM.get(ADDR_Deviationtabel + i*2, v);
+             EEPROM.put(ADDR_Deviationtabel_copy1 + i*2, v);
          }
          EEPROM.commit();
          Serial.println("Deviationtabel copy saved in StorageArea 1");
@@ -784,11 +842,11 @@ void CheckForCalibration()
       }
       if(Val == String("copyd2"))
       {
-         int8_t v;
+         int16_t v;
          for (uint16_t i = 0; i < 360;i++)
          {
-             v = (int8_t)EEPROM.readByte(ADDR_Deviationtabel + i);
-             EEPROM.writeByte(ADDR_Deviationtabel_copy2 + i, v);
+             EEPROM.get(ADDR_Deviationtabel + i*2, v);
+             EEPROM.put(ADDR_Deviationtabel_copy2 + i*2, v);
          }
          EEPROM.commit();
          Serial.println("Deviationtabel copy saved in StorageArea 2");
@@ -796,11 +854,11 @@ void CheckForCalibration()
       }
       if(Val == String("restd1"))
       {
-         int8_t v;
+         int16_t v;
          for (uint16_t i = 0; i < 360;i++)
          {
-             v = (int8_t)EEPROM.readByte(ADDR_Deviationtabel_copy1 + i);
-             EEPROM.writeByte(ADDR_Deviationtabel + i, v);
+             EEPROM.get(ADDR_Deviationtabel_copy1 + i*2, v);
+             EEPROM.put(ADDR_Deviationtabel + i*2, v);
          }
          EEPROM.commit();
          Serial.println("Deviationtabel resored from StorageArea 1");
@@ -808,15 +866,73 @@ void CheckForCalibration()
       }
       if(Val == String("restd2"))
       {
-         int8_t v;
+         int16_t v;
          for (uint16_t i = 0; i < 360;i++)
          {
-             v = (int8_t)EEPROM.readByte(ADDR_Deviationtabel_copy2 + i);
-             EEPROM.writeByte(ADDR_Deviationtabel + i, v);
+             EEPROM.get(ADDR_Deviationtabel_copy2 + i*2, v);
+             EEPROM.put(ADDR_Deviationtabel + i*2, v);
          }
          EEPROM.commit();
          Serial.println("Deviationtabel resored from StorageArea 2");
          pBlueTooth->SendString("Deviationtabel resored from StorageArea 2\n");
+      }
+      if(Val == String("printd1"))
+      {
+         uint16_t temp;
+         for (uint16_t j = 0; j < 360; j++)
+         {
+            EEPROM.get(ADDR_Deviationtabel_copy1 + j*2,temp);
+            double ve = (double)((int16_t)temp / (double)10);
+            if(j % 10 == 0)
+            {
+                Serial.println(""); pBlueTooth->SendString("\n");
+            }
+            if (ve <= 50.2 && ve >= -50.2) 
+            {
+              Serial.print(j);Serial.print("=");Serial.print(ve);Serial.print(" ");
+              sprintf(dummy,"%i",j);
+              pBlueTooth->SendString(dummy);pBlueTooth->SendString("=");
+              sprintf(dummy,"%2.1f",ve);
+              pBlueTooth->SendString(dummy);pBlueTooth->SendString(" ");
+            }
+            else  // Not avalibal 
+            {
+              Serial.print(j);Serial.print("=");Serial.print("NA ");
+              sprintf(dummy,"%i",j);
+              pBlueTooth->SendString(dummy);pBlueTooth->SendString("=");
+              pBlueTooth->SendString("NA ");
+            }
+         }
+         Serial.println(""); pBlueTooth->SendString("\n");
+      }
+      if(Val == String("printd2"))
+      {
+         uint16_t temp;
+         for (uint16_t j = 0; j < 360; j++)
+         {
+            EEPROM.get(ADDR_Deviationtabel_copy2 + j*2,temp);
+            double ve = (double)((int16_t)temp / (double)10);
+            if(j % 10 == 0)
+            {
+                Serial.println(""); pBlueTooth->SendString("\n");
+            }
+            if (ve <= 50.2 && ve >= -50.2) 
+            {
+              Serial.print(j);Serial.print("=");Serial.print(ve);Serial.print(" ");
+              sprintf(dummy,"%i",j);
+              pBlueTooth->SendString(dummy);pBlueTooth->SendString("=");
+              sprintf(dummy,"%2.1f",ve);
+              pBlueTooth->SendString(dummy);pBlueTooth->SendString(" ");
+            }
+            else  // Not avalibal 
+            {
+              Serial.print(j);Serial.print("=");Serial.print("NA ");
+              sprintf(dummy,"%i",j);
+              pBlueTooth->SendString(dummy);pBlueTooth->SendString("=");
+              pBlueTooth->SendString("NA ");
+            }
+         }
+         Serial.println(""); pBlueTooth->SendString("\n");
       }
       if(Val == String("showdev"))
       {
@@ -827,7 +943,7 @@ void CheckForCalibration()
          Serial.println("Heading send with Deviation");
          pBlueTooth->SendString("Heading send with Deviation\n");
          SendHeadingwithDeviation = true;
-         EEPROM.writeByte(ADDR_Deviationtabel + 361, 0x01);
+         EEPROM.writeByte(ADDR_Deviationtabel + 721, 0x01);
          EEPROM.commit();
       }
       if(Val == String("stopdev"))
@@ -835,7 +951,7 @@ void CheckForCalibration()
          Serial.println("Heading not send with Deviation");
          pBlueTooth->SendString("Heading not send with Deviation\n");
          SendHeadingwithDeviation = false;
-         EEPROM.writeByte(ADDR_Deviationtabel + 361, 0x00);
+         EEPROM.writeByte(ADDR_Deviationtabel + 721, 0x00);
          EEPROM.commit();
       }
       if(Val.substring(0, 7) == String("setvari"))
@@ -850,16 +966,16 @@ void CheckForCalibration()
       if(Val.substring(0, 6) == String("defdev"))
       {
          double vd = Val.substring(7, Val.length()).toDouble();
-         if (vd < -12 || vd > 12 || HeadingFiltered > 359)
+         if (vd < -50 || vd > 50 || HeadingFiltered > 359)
          {
              Serial.println("Wert nicht moeglich");
              pBlueTooth->SendString("Wert nicht moeglich\n");
              return;
          }
-         int8_t v = (int8_t) (vd * 10); // Kommastelle
+         int16_t v = (int16_t) (vd * 10); // Kommastelle
          int D = (int)round(HeadingFiltered);
          if(D >= 360) D -= 360;
-         EEPROM.writeByte(ADDR_Deviationtabel + D , v);
+         EEPROM.put(ADDR_Deviationtabel + D*2 , v);
          EEPROM.commit();
          sprintf(dummy,"%2.1f",vd);
          Serial.print("Set:");Serial.print(vd);Serial.print(" for Heading:");Serial.println(D);
@@ -889,8 +1005,8 @@ void CheckForCalibration()
       }      
       if(Val == String("scogdev"))
       {
-        Serial.println("Deviationtabel ready");
-        pBlueTooth->SendString("Deviationtabel ready\n");
+        Serial.println("Deviationtabel saved");
+        pBlueTooth->SendString("Deviationtabel saved ... ready\n");
         EEPROM.commit();
         MakeDeviationtabel = false;
       }
@@ -913,24 +1029,25 @@ void CheckForCalibration()
               Variation = EnteredVariation;
          // COG = Heading + Variation + Deviation
          double Deviation = DEGCOG - HeadingFiltered - Variation;
-         if ( Deviation < -12)
-            Deviation = -12;
-         if ( Deviation > 12)
-            Deviation = 12;
+         if ( Deviation < -50)
+            Deviation = -50;
+         if ( Deviation > 50)
+            Deviation = 50;
          // Write to EEPROM
-         int8_t v  = 0x7F;
-         if (Deviation != 12 && Deviation != -12)   // Not when Deviation ist bad
-            v = (int8_t) (Deviation * 10); // Kommastelle
+         int16_t v  = 0x7FFF;
+         if (Deviation != 50 && Deviation != -50)   // Not when Deviation ist bad
+            v = (int16_t) (Deviation * 10); // Kommastelle
          int D = (int)round(HeadingFiltered);
          if(D >= 360) D -= 360;
-         int8_t ve = (int8_t)EEPROM.readByte(ADDR_Deviationtabel + D);
-         if( ve != 0x7F) // Not first Use
+         int16_t ve;
+         EEPROM.get(ADDR_Deviationtabel + D*2, ve);
+         if( ve != 0x7FFF) // Not first Use
          {
              Serial.println("Deviation bereits vorhanden.");
              pBlueTooth->SendString("Deviation bereits vorhanden.\n");
-          if (v != 0x7F)   // Not when Deviation ist bad
+          if (v != 0x7FFF)   // Not when Deviation ist bad
           {
-             v = (int8_t) ((double) v * 0.9 + (double)ve * 0.1);
+             v = (int16_t) ((double) v * 0.9 + (double)ve * 0.1);
           }   
           else
           {
@@ -942,10 +1059,10 @@ void CheckForCalibration()
          Serial.print("Save Heading:"); Serial.print(HeadingFiltered);
          sprintf(dummy,"%3.1f",HeadingFiltered);
          pBlueTooth->SendString("Save Heading:"); pBlueTooth->SendString(dummy);pBlueTooth->SendString(" ");
-         sprintf(dummy,"%2.1f",(float) ((int8_t)v / (double)10));
+         sprintf(dummy,"%2.1f",(float) ((int16_t)v / (double)10));
          Serial.print(" Deviation :");
          pBlueTooth->SendString(" Deviation :");
-         if (v == 0x7F)
+         if (v == 0x7FFF)
          {
             Serial.println("NA");
             pBlueTooth->SendString("NA\n");
@@ -955,7 +1072,7 @@ void CheckForCalibration()
             Serial.println(v);
             pBlueTooth->SendString(dummy);pBlueTooth->SendString(" \n");
          }
-         EEPROM.writeByte(ADDR_Deviationtabel + D , (int8_t)v);
+         EEPROM.put(ADDR_Deviationtabel + D*2 , (int16_t)v);
          EEPROM.commit();
       }
       if(Val.substring(0, 4) == String("hdev"))
@@ -968,7 +1085,7 @@ void CheckForCalibration()
              sprintf(dummy,"%i",hd);
              pBlueTooth->SendString("delete Deviation at Heading: ");
              pBlueTooth->SendString(dummy);pBlueTooth->SendString("\n");
-             EEPROM.writeByte(ADDR_Deviationtabel + hd , 0x7F);
+             EEPROM.put(ADDR_Deviationtabel + hd*2 , 0x7FFF);
              EEPROM.commit();
              return; 
           }
@@ -980,7 +1097,7 @@ void CheckForCalibration()
              pBlueTooth->SendString("Heading wrong\n");
              return;  
           }
-          if (v < -12 || v > 12)
+          if (v < -50 || v > 50)
           {
              Serial.println("Deviation wrong");
              pBlueTooth->SendString("Deviation wrong\n");
@@ -994,14 +1111,14 @@ void CheckForCalibration()
           Serial.println(v);
           pBlueTooth->SendString(" Deviation :");
           pBlueTooth->SendString(dummy);pBlueTooth->SendString(" \n");
-          EEPROM.writeByte(ADDR_Deviationtabel + hd , (int8_t)(v * 10));
+          EEPROM.put(ADDR_Deviationtabel + hd*2 , (int16_t)(v * 10));
           EEPROM.commit();          
       }
       if(Val == String("cleardev"))
       {
           for (uint16_t i = 0; i < 360; i++)
           {
-             EEPROM.writeByte(ADDR_Deviationtabel + i , 0x7F);    // 127 !!!         
+             EEPROM.put(ADDR_Deviationtabel + i*2 , 0x7FFF);    //  !!!         
           }
           EEPROM.commit();
           Serial.println("Deviationtabel deleted");
@@ -1010,14 +1127,16 @@ void CheckForCalibration()
       }
       if(Val == String("printdev"))
       {
+         uint16_t temp;
          for (uint16_t j = 0; j < 360; j++)
          {
-            double ve = (double)((int8_t)EEPROM.readByte(ADDR_Deviationtabel + j) / (double)10);
+            EEPROM.get(ADDR_Deviationtabel + j*2,temp);
+            double ve = (double)((int16_t)temp / (double)10);
             if(j % 10 == 0)
             {
                 Serial.println(""); pBlueTooth->SendString("\n");
             }
-            if (ve <= 12.2 && ve >= -12.2) 
+            if (ve <= 50.2 && ve >= -50.2) 
             {
               Serial.print(j);Serial.print("=");Serial.print(ve);Serial.print(" ");
               sprintf(dummy,"%i",j);
@@ -1025,7 +1144,7 @@ void CheckForCalibration()
               sprintf(dummy,"%2.1f",ve);
               pBlueTooth->SendString(dummy);pBlueTooth->SendString(" ");
             }
-            else  // Not avalibal 127 !!! Not set
+            else  // Not avalibal 
             {
               Serial.print(j);Serial.print("=");Serial.print("NA ");
               sprintf(dummy,"%i",j);
@@ -1057,6 +1176,22 @@ void CheckForCalibration()
         Serial.println("Switch send Heading OFF.");
         pBlueTooth->SendString("Switch send Heading OFF.\n");
         EEPROM.writeByte(ADDR_SEND_HEADING, 0);
+        EEPROM.commit();
+        delay (2000);
+      }
+      if(Val == String("sendheave"))
+      {
+        Serial.println("Switch sending Heave to N2k ON.");
+        pBlueTooth->SendString("Switch sending Heave to N2k ON.\n");
+        EEPROM.writeByte(ADDR_SEND_HEAVE, 1);
+        EEPROM.commit();
+        delay (2000);
+      }
+      if(Val == String("stopheave"))
+      {
+        Serial.println("Switch sending Heave to N2k OFF.");
+        pBlueTooth->SendString("Switch sending Heave to N2k OFF.\n");
+        EEPROM.writeByte(ADDR_SEND_HEAVE, 0);
         EEPROM.commit();
         delay (2000);
       }
@@ -1221,9 +1356,7 @@ void HandleNMEA2000Msg(const tN2kMsg &N2kMsg) {
       uint16_t Key, Command, Value;
       if (ParseN2kPGN130845(N2kMsg, Key, Command, Value))
       {
-#ifdef DEBUG        
-         Serial.printf("Key: %d Command: %d Value: %d\n", Key, Command, Value);
-#endif
+        // Nothing to do
       }
       break;
   } 
@@ -1261,9 +1394,6 @@ bool ParseN2kPGN130850(const tN2kMsg &N2kMsg)
 
 bool ParseN2kPGN130845(const tN2kMsg &N2kMsg, uint16_t &Key, uint16_t &Command, uint16_t &Value)
 {
-#ifdef DEBUG
-  Serial.println("Entering ParseN2kPGN130845");
-#endif
   if (N2kMsg.PGN != 130845L) return false;
   int Index=2;
   unsigned char Target = N2kMsg.GetByte(Index);
@@ -1479,21 +1609,5 @@ bool saveGroundCalibration()
 
 void PrintSensoroffsets()
 {
-#ifdef DEBUG
-  Serial.print("accel_offset_x "); Serial.println(BNO055Offset.accel_offset_x); /**< x acceleration offset */
-  Serial.print("accel_offset_y "); Serial.println(BNO055Offset.accel_offset_y); /**< y acceleration offset */
-  Serial.print("accel_offset_z "); Serial.println(BNO055Offset.accel_offset_z); /**< z acceleration offset */
-  Serial.println("");
-  Serial.print("mag_offset_x   "); Serial.println(BNO055Offset.mag_offset_x); /**< x magnetometer offset */
-  Serial.print("mag_offset_y   "); Serial.println(BNO055Offset.mag_offset_y); /**< y magnetometer offset */
-  Serial.print("mag_offset_z   "); Serial.println(BNO055Offset.mag_offset_z); /**< z magnetometer offset */
-  Serial.println("");
-  Serial.print("gyro_offset_x  "); Serial.println(BNO055Offset.gyro_offset_x); /**< x gyroscrope offset */
-  Serial.print("gyro_offset_y  "); Serial.println(BNO055Offset.gyro_offset_y); /**< y gyroscrope offset */
-  Serial.print("gyro_offset_z  "); Serial.println(BNO055Offset.gyro_offset_z); /**< z gyroscrope offset */
-  Serial.println("");
-  Serial.print("accel_radius   "); Serial.println(BNO055Offset.accel_radius); /**< acceleration radius */
-  Serial.println("");
-  Serial.print("mag_radius     "); Serial.println(BNO055Offset.mag_radius); /**< magnetometer radius */
-#endif
+  //
 }
