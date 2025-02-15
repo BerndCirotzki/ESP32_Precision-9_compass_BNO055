@@ -1,8 +1,8 @@
 //
 // NMEA 2000 Kurssensor 
-// Bernd Cirotzki 2022 - 2024
+// Bernd Cirotzki 2022 - 2025
 //
-// Ausgabe im NMEA 2000-Format  
+// Ausgabe im NMEA 2000-Format original Angabe precision 9 compass 
 // - Meldungen: PGN 127250, 127251, 127257, 127252
 // - Datenausgabe: Magnetische Kursdaten (20 Hz), Dreh-Geschwindigkeit (20 Hz),
 // Neigen/Rollen (10 Hz), Seegangsausgleich (10 Hz)
@@ -171,11 +171,12 @@ Adafruit_BNO055 BNO055 =  Adafruit_BNO055();
 
 adafruit_bno055_offsets_t BNO055Offset;
 
-const uint16_t EEPROM_SIZE = (18 + sizeof(adafruit_bno055_offsets_t) + 725 + 2 * 720 + 2);
+const uint16_t EEPROM_SIZE = (18 + sizeof(adafruit_bno055_offsets_t) + 725 + 2 * 720 + 3);
 const uint16_t ADDR_Deviationtabel = 19 + sizeof(adafruit_bno055_offsets_t);
 const uint16_t ADDR_Deviationtabel_copy1 = ADDR_Deviationtabel + 725;
 const uint16_t ADDR_Deviationtabel_copy2 = ADDR_Deviationtabel_copy1 + 720;
 const uint16_t ADDR_SEND_HEAVE = ADDR_Deviationtabel_copy2 + 720;
+const uint16_t ADDR_MAHONY = ADDR_SEND_HEAVE + 1;
 
 BluetoothStream *pBlueTooth;
 uint8_t LastMAGCal = 0;
@@ -192,6 +193,7 @@ unsigned long LastShowdiv;
 
 heave Heave;
 double HeaveValue = 0;
+double HeaveValue_bbn = 0;
                                          
 void setup() 
 {
@@ -271,6 +273,21 @@ void setup()
   {
       Serial.println("Send Heave to N2k");  
       pBlueTooth->SendString("Send Heave to N2k\n");
+      if(EEPROM.readByte(ADDR_MAHONY) == 1)
+      {
+           Serial.println("Heave Filter is Mahony");  
+           pBlueTooth->SendString("Heave Filter is Mahony\n");
+      }
+      else if(EEPROM.readByte(ADDR_MAHONY) == 2)
+      {
+           Serial.println("Heave Filter is Mixed Filter");  
+           pBlueTooth->SendString("Heave Filter is Mixed Filter\n");
+      }
+      else
+      {
+          Serial.println("Heave is normal");  
+          pBlueTooth->SendString("Heave is normal\n");
+      }
   }
   else
   {
@@ -325,7 +342,7 @@ bool GetBNO055Values()
 {
   if (SampleTimer + BNO055_SAMPLERATE_DELAY_MS <= millis())                  // Set timer
   {
-    SampleTimer = millis();    
+    SampleTimer = millis();  
     imu::Vector<3> acc = BNO055.getVector(Adafruit_BNO055::VECTOR_ACCELEROMETER);
     imu::Vector<3> gyr = BNO055.getVector(Adafruit_BNO055::VECTOR_GYROSCOPE);
     imu::Vector<3> mag = BNO055.getVector(Adafruit_BNO055::VECTOR_MAGNETOMETER);
@@ -371,6 +388,8 @@ bool GetBNO055Values()
     // Heave berechnung
            
     HeaveValue = Heave.GetHeave((sqrt(acc.x() * acc.x() + acc.y() * acc.y() + acc.z() * acc.z() )), PitchAccHead, RollAccHead, dt);
+    //HeaveValue_bbn = Heave.ProcessIMU_data_heave(acc.x(), acc.y(), acc.z(),gyr.x()* degToRad, gyr.y()* degToRad, gyr.z()* degToRad);
+    HeaveValue_bbn = Heave.ProcessIMU_data_heave(acc_x, acc_y, acc_z , gyr.x()* degToRad, gyr.y()* degToRad, gyr.z()* degToRad);
 
     // Heading berechnen
     // with tilt compensated ... standard formel.
@@ -465,7 +484,12 @@ void loop()
         N2kMsg.Clear();
         if (Heave.HeaveAvailable() && 0 != EEPROM.readByte(ADDR_SEND_HEAVE))
         {
-          SetN2kHeave(N2kMsg, SID, HeaveValue);
+          if (1 == EEPROM.readByte(ADDR_MAHONY))   // Mahony
+            SetN2kHeave(N2kMsg, SID, HeaveValue_bbn);
+          else if (2 == EEPROM.readByte(ADDR_MAHONY))  // Mixed
+            SetN2kHeave(N2kMsg, SID, (HeaveValue_bbn + HeaveValue) / 2); 
+          else
+            SetN2kHeave(N2kMsg, SID, HeaveValue);
           NMEA2000.SendMsg(N2kMsg, DEV_COMPASS);
         }
       }
@@ -778,8 +802,11 @@ void CheckForCalibration()
          Serial.println("stophead  :  Switch Send heading OFF. to N2k and to Bluetooth.");
          Serial.println("senddev   :  Send Heading with Deviation");
          Serial.println("stopdev   :  Do not Send Heading with Deviation. Send Deviation in the rigth field");
-         Serial.println("sendheave :  Switch Send Heave N2k ON. (default On) \n");
-         Serial.println("stopheave :  Switch Send Heave N2k OFF.\n");
+         Serial.println("sendheave :  Switch Send Heave N2k ON. (default On)");
+         Serial.println("stopheave :  Switch Send Heave N2k OFF.");
+         Serial.println("sendmahony:  Switch Send Heave with Mahonyfilter.");
+         Serial.println("sendnormal:  Switch Send Heave with normal Filter. (default on)");
+         Serial.println("sendmixed :  Switch Send Heave mix the normal Filter and the mahony filter.");
          Serial.println("calgyro   :  Start Gyro Sensor Calibration.");
          Serial.println("cal       :  Start Sensor Calibration. Make calacc and calgyro again");
          Serial.println("calacc    :  Start Sensor accel Calibration.");
@@ -807,6 +834,9 @@ void CheckForCalibration()
          pBlueTooth->SendString("stopdev   :  Do not Send Heading with Deviation. Send Deviation in the rigth field\n");
          pBlueTooth->SendString("sendheave :  Switch Send Heave N2k ON. (default On) \n");
          pBlueTooth->SendString("stopheave :  Switch Send Heave N2k OFF.\n");
+         pBlueTooth->SendString("sendmahony:  Switch Send Heave with Mahonyfilter.\n");
+         pBlueTooth->SendString("sendnormal:  Switch Send Heave with normal Filter. (default on)\n");
+         pBlueTooth->SendString("sendmixed :  Switch Send Heave mix the normal Filter and the mahony filter.\n");
          pBlueTooth->SendString("calgyro   :  Start Gyro Sensor Calibration.\n");
          pBlueTooth->SendString("cal       :  Start Sensor Calibration. Make calacc and calgyro again\n");
          pBlueTooth->SendString("calacc    :  Start Sensor accel Calibration.\n");
@@ -1195,6 +1225,30 @@ void CheckForCalibration()
         EEPROM.commit();
         delay (2000);
       }
+      if(Val == String("sendmahony"))
+      {
+        Serial.println("Switch sending Heave with Mahonyfilter.");
+        pBlueTooth->SendString("Switch sending Heave with Mahonyfilter.\n");
+        EEPROM.writeByte(ADDR_MAHONY, 1);
+        EEPROM.commit();
+        delay (2000);
+      }
+      if(Val == String("sendnormal"))
+      {
+        Serial.println("Switch sending Heave with Normal-filter.");
+        pBlueTooth->SendString("Switch sending Heave with Normal-filter.\n");
+        EEPROM.writeByte(ADDR_MAHONY, 0);
+        EEPROM.commit();
+        delay (2000);
+      }
+      if(Val == String("sendmixed"))
+      {
+        Serial.println("Switch sending Heave with Mixed-filter.");
+        pBlueTooth->SendString("Switch sending Heave with Mixed-filter.\n");
+        EEPROM.writeByte(ADDR_MAHONY, 2);
+        EEPROM.commit();
+        delay (2000);
+      }
       if(Val == String("cal") && calibrationStart == false)
       {
           // delete the calibration now.
@@ -1356,7 +1410,7 @@ void HandleNMEA2000Msg(const tN2kMsg &N2kMsg) {
       uint16_t Key, Command, Value;
       if (ParseN2kPGN130845(N2kMsg, Key, Command, Value))
       {
-        // Nothing to do
+		// Nothing to do
       }
       break;
   } 
