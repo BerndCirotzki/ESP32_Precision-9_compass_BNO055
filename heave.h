@@ -3,38 +3,8 @@
 // File Name     : 'heave.h'
 // Improoved by  : Bernd Cirotzki
 
-/*
-  1Hz
-
-$GPHEV,H,*hh<CR><LF>
-Description
-1 $: Talker identifier
-2 GPHEV: Datagram identifier
-3 H: Heave (Metres)
-4 *hh: Checksum
-Related topics
-Supported datagram formats, page 12
-Datagram formats, page 25
-Third-party datagram formats, page 71
-
-Here are a few more Heave examples from my boat (using YNDU RAW)
-10:50:07.240 R 0DF1140A 00 11 00 FF FF FF FE FF
-10:50:07.339 R 0DF1140A 00 11 00 FF FF FF 7F FD
-10:50:07.442 R 0DF1140A 00 11 00 FF FF FF FE FF
-10:50:07.540 R 0DF1140A 00 11 00 FF FF FF 7F FD
-10:50:07.690 R 0DF1140A 00 11 00 FF FF FF 7F FD
-10:50:07.739 R 0DF1140A 00 11 00 FF FF FF 7F FD
-10:50:07.801 R 0DF1140A 00 11 00 FF FF FF FE FF
-10:50:09.708 R 0DF1140A 00 0F 00 FF FF FF FF FF
-10:50:09.101 R 0DF1140A 00 0F 00 FF FF FF 7F FD
-
- */
-
 #ifndef HEAVE_H
 #define HEAVE_H
-
-// To Put out debug to Serial
-//#define DEBUG 1
 
 #include <Arduino.h>
 #include <math.h>

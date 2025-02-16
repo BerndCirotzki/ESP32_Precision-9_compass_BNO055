@@ -17,18 +17,6 @@
 #include "KalmanForWaveAlt.h"
 #include "WaveFilters.h"
 
-#ifdef DEBUG
-extern float AccNew;
-extern float AccDurch;
-extern float AddVeloG;
-extern float PVelocity;
-extern float ACC_DURCH;
-extern float VELO_DURCH;
-extern float HEAVE_DURCH;
-extern float HEAVE_MAX;
-extern float HEAVE_MIN;
-#endif
-
 MinMaxLemire min_max_h;
 AranovskiyParams arParams;
 AranovskiyState arState;
@@ -132,12 +120,6 @@ double heave::GetHeave(float acc, float PitchAccHead,float RollAccHead, float dt
     VelocityValue = Addvelo + PreviousVelocity * 0.98;
     if (abs(VelocityValue) < 0.03) VelocityValue = 0;
     PreviousVelocity = VelocityValue;
-#ifdef DEBUG
-AccNew = AccValue;
-AccDurch = AccAverage;
-AddVeloG = Addvelo;
-PVelocity = PreviousVelocity;
-#endif 
     HeaveValue = HeaveValue + (PreviousVelocity  * dt);
     HeaveValue = CheckHeave(HeaveValue);
     return HeaveValue;      
@@ -199,10 +181,6 @@ float heave::CheckHeave(float heavein)
           }
     }
     Heave_vorher = heavein;
-#ifdef DEBUG
-HEAVE_MAX = Heave_Max_positiv;
-HEAVE_MIN = Heave_Max_negativ;
-#endif
    if(++diffcounter >= TENDENZCOUNTER) diffcounter = 0;
    float Heaveoffset = (Heave_Max_positiv + Heave_Max_negativ) / 2;
    if (Heaveoffset > 0)
